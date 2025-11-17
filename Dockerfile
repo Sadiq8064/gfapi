@@ -1,26 +1,25 @@
-# Dockerfile
 FROM python:3.11-slim
 
+# Prevent Python from buffering stdout (useful for logging)
+ENV PYTHONUNBUFFERED=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt /app/requirements.txt
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy application
+COPY . /app
 WORKDIR /app
 
-# copy files
-COPY gfsapi.py /app/
-COPY requirements.txt /app/
-
-# ensure pip, then install
-RUN python -m pip install --upgrade pip
-RUN pip install -r requirements.txt
-
-# create upload folder & ensure data file exists
-RUN mkdir -p /app/uploads
-RUN python - <<'PY'
-from pathlib import Path, PurePath
-p = Path("gemini_stores.json")
-if not p.exists():
-    p.write_text('{"file_stores": {}, "current_store_name": null}')
-Path("uploads").mkdir(parents=True, exist_ok=True)
-PY
-
+# Expose FastAPI PORT
 EXPOSE 8000
 
+# Start API
 CMD ["uvicorn", "gfsapi:app", "--host", "0.0.0.0", "--port", "8000"]
