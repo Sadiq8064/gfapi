@@ -28,8 +28,9 @@ except Exception:
     types = None
 
 # ---------------- CONFIG ----------------
-DATA_FILE = "gemini_stores.json"
-UPLOAD_ROOT = Path("uploads")           # temporary local storage during upload
+DATA_FILE = "/data/gemini_stores.json"
+UPLOAD_ROOT = Path("/data/uploads")
+        # temporary local storage during upload
 MAX_FILE_BYTES = 50 * 1024 * 1024      # 50 MB default limit (can be skipped via form)
 POLL_INTERVAL = 2                       # seconds between polling long-running operations
 GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
