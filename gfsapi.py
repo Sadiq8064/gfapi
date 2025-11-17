@@ -1,28 +1,16 @@
+# gemini_file_search_api.py
 """
-gemini_file_search_api.py
-
 FastAPI backend for REAL Gemini File Search RAG (Option A: delete local temp file after indexing).
-This version ensures upload responses include helpful instructions and the uploaded document id/resource
-so you can delete the document later.
-
-Endpoints:
-- POST /stores/create         -> create a File Search store
-- POST /stores/{store}/upload -> upload (index) one or more files into the File Search store
-- GET  /stores                -> list local stores and their files (with document ids when available)
-- DELETE /stores/{store}/documents/{document_id} -> delete a specific document from the file search store (REST)
-- DELETE /stores/{store}     -> delete entire store (remote + local)
-- POST /ask                  -> ask RAG question using one or more file search stores
-
-Notes:
-- Clients MUST pass their Gemini API key on each request (we do not persist API keys).
-- If the Python SDK does not return document resource name on upload operation, we call the REST documents list
-  to find the document by displayName (filename).
+- Keeps document_id logic (SDK + REST fallback).
+- Sanitizes filenames before uploading to avoid "Illegal header value" errors.
+- Deletes local temp file after successful (or attempted) indexing.
 """
 
 import os
 import time
 import json
 import shutil
+import re
 import requests
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -130,19 +118,51 @@ def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
     except Exception:
         return []
 
-# ---------------- Utility: build delete instruction template ----------------
+# ---------------- Filename sanitization ----------------
 
-def build_delete_instructions(local_store_name: str, document_id: Optional[str]):
+def clean_filename(name: str, max_len: int = 180) -> str:
     """
-    Returns a dictionary containing clear instructions a user can copy/paste to delete a document.
-    We don't embed the user's API key; they must supply their own api_key parameter.
+    Sanitize filenames to avoid server/API header issues.
+    Rules applied:
+      - strip leading/trailing whitespace
+      - normalize internal whitespace -> single underscore
+      - replace disallowed characters with underscore
+      - collapse consecutive underscores
+      - truncate to max_len
+      - avoid empty result (fallback to 'file')
     """
-    example_delete_url = "DELETE https://gfapi-production.up.railway.app/stores/{store_name}/documents/{document_id}?api_key=YOUR_API_KEY"
-    return {
-        "note": "To delete this document from the File Search store, use the DELETE endpoint below (replace placeholders).",
-        "endpoint_template": example_delete_url,
-        "example": example_delete_url.format(store_name=local_store_name, document_id=document_id or "<DOCUMENT_ID>")
-    }
+    if not name:
+        return "file"
+
+    # Normalize unicode and strip
+    name = str(name).strip()
+
+    # Replace any whitespace sequence with single underscore
+    name = re.sub(r"\s+", "_", name)
+
+    # Remove leading dots (avoid hidden files like .env)
+    name = re.sub(r"^\.+", "", name)
+
+    # Keep only safe characters: letters, digits, underscores, hyphens, dots
+    name = re.sub(r"[^A-Za-z0-9_\-\.]", "_", name)
+
+    # Collapse multiple underscores or dots
+    name = re.sub(r"__+", "_", name)
+    name = re.sub(r"\.\.+", ".", name)
+
+    # Trim to max length
+    if len(name) > max_len:
+        name = name[:max_len]
+
+    # Final fallback
+    if not name:
+        return "file"
+    return name
+
+# ---------------- Utility: build delete instruction template (NOT returned on upload per your request) ----------------
+
+def _build_example_delete_url(store_name: str, document_id: Optional[str]):
+    return f"DELETE /stores/{store_name}/documents/{document_id}?api_key=YOUR_API_KEY"
 
 # =====================================================
 # CREATE STORE (creates a Gemini File Search store)
@@ -155,6 +175,7 @@ def create_store(payload: CreateStoreRequest):
       - store_name: what you provided (local identifier)
       - file_search_store_resource: the Gemini resource name (fileSearchStores/...)
       - created_at, file_count
+    Note: no extra instructions are returned per request.
     """
     try:
         client = init_gemini_client(payload.api_key)
@@ -186,12 +207,7 @@ def create_store(payload: CreateStoreRequest):
         "store_name": payload.store_name,
         "file_search_store_resource": fs_store_name,
         "created_at": created_at,
-        "file_count": 0,
-        "instructions": {
-            "upload": "POST /stores/{store_name}/upload (multipart/form-data). form fields: api_key (string), limit (true/false), files (file[])",
-            "list": "GET /stores?api_key=YOUR_API_KEY (lists stores and file metadata)",
-            "delete_store": "DELETE /stores/{store_name}?api_key=YOUR_API_KEY"
-        }
+        "file_count": 0
     }
 
 # =====================================================
@@ -205,9 +221,9 @@ async def upload_files(
     files: List[UploadFile] = File(...)
 ):
     """
-    Upload and index files to the given store. Returns helpful JSON including:
-      - filename, uploaded, indexed, document_resource (fileSearchStores/.../documents/...), document_id
-      - delete_instructions: how to delete the uploaded doc (template)
+    Upload and index files to the given store. Returns:
+      - filename, uploaded, indexed (bool), document_resource, document_id, gemini_error
+    (No deletion instructions returned in response per your request.)
     """
     data = load_data()
     if store_name not in data["file_stores"]:
@@ -230,7 +246,9 @@ async def upload_files(
     results = []
 
     for upload in files:
-        filename = os.path.basename(upload.filename)
+        original_filename = upload.filename or "file"
+        filename = clean_filename(original_filename)
+
         temp_path = temp_folder / filename
 
         # ---- write the file locally in streaming chunks (required by SDK) ----
@@ -276,6 +294,7 @@ async def upload_files(
         gemini_error = None
 
         try:
+            # Use the sanitized filename in the display_name sent to Gemini
             op = client.file_search_stores.upload_to_file_search_store(
                 file=str(temp_path),
                 file_search_store_name=fs_store_name,
@@ -293,15 +312,14 @@ async def upload_files(
             # If SDK did not provide document resource, call REST to list documents and match by displayName
             if not document_resource:
                 docs = rest_list_documents_for_store(fs_store_name, api_key)
-                # look for document whose displayName matches filename (best-effort)
+                # look for document whose displayName matches sanitized filename (best-effort)
                 for d in docs:
-                    # d may contain 'displayName' or 'display_name' depending on API; handle both
                     display = d.get("displayName") or d.get("display_name") or ""
                     name = d.get("name") or ""
                     if display and display == filename:
                         document_resource = name
                         break
-                # if still not found, fallback: use any document whose name contains filename token (not ideal)
+                # fallback: match partial token
                 if not document_resource:
                     for d in docs:
                         name = d.get("name") or ""
@@ -313,7 +331,9 @@ async def upload_files(
                 document_id = document_resource.split("/")[-1]
                 indexed_ok = True
             else:
-                indexed_ok = True  # indexing likely happened (Gemini returned no resource) but we couldn't fetch id
+                # If no resource returned but SDK operation finished without raising,
+                # indexing most likely occurred — still mark indexed_ok True but doc id unknown.
+                indexed_ok = True
 
         except Exception as e:
             gemini_error = str(e)
@@ -339,17 +359,13 @@ async def upload_files(
         store_meta.setdefault("files", []).append(entry)
         save_data(data)
 
-        # Build the response object for this uploaded file with helpful instructions
-        delete_instructions = build_delete_instructions(store_name, document_id)
-
         results.append({
             "filename": filename,
             "uploaded": True,
             "indexed": indexed_ok,
             "document_resource": document_resource,
             "document_id": document_id,
-            "gemini_error": gemini_error,
-            "delete_instructions": delete_instructions
+            "gemini_error": gemini_error
         })
 
     # return consolidated result
@@ -376,7 +392,7 @@ def list_stores(api_key: str):
 @app.delete("/stores/{store_name}/documents/{document_id}")
 def delete_document(store_name: str, document_id: str, api_key: str):
     """
-    Delete a single document from the File Search store using Fleet REST:
+    Delete a single document from the File Search store using REST:
       DELETE https://generativelanguage.googleapis.com/v1beta/{fileSearchStore}/documents/{document_id}?force=true&key={api_key}
     Also removes this document entry from local metadata.
     """
@@ -406,7 +422,7 @@ def delete_document(store_name: str, document_id: str, api_key: str):
     data["file_stores"][store_name] = meta
     save_data(data)
 
-    return {"success": True, "deleted_document_id": document_id, "note": "Removed from remote store and local metadata"}
+    return {"success": True, "deleted_document_id": document_id}
 
 # =====================================================
 # DELETE ENTIRE STORE (remote + local)
