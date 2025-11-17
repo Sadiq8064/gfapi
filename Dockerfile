@@ -4,7 +4,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # copy files
-COPY gemini_file_search_api.py /app/
+COPY gfsapi.py /app/
 COPY requirements.txt /app/
 
 # ensure pip, then install
