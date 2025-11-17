@@ -1,8 +1,7 @@
-fastapi>=0.95.0
-uvicorn[standard]>=0.22.0
-python-multipart>=0.0.6
-aiofiles>=23.1.0
-pydantic>=1.10.0
-# The Gemini SDK - please install the official package you use locally.
-# The filename below is a common pip package name; adjust if your environment requires a different package name.
-google-genai>=0.1.0
+fastapi
+uvicorn
+aiofiles
+google-genai
+requests
+pydantic
+python-multipart
