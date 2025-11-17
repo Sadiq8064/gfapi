@@ -111,14 +111,12 @@ def create_store(request: CreateStoreRequest):
     store_folder.mkdir(parents=True, exist_ok=True)
 
     return {
-        "success": True,
-        "store": {
-            "display_name": meta["display_name"],
-            "name": meta["name"],
-            "created_at": meta["created_at"],
-            "files_count": 0
-        }
-    }
+    "success": True,
+    "store_name": request.store_name,
+    "created_at": meta["created_at"],
+    "file_count": 0
+}
+
 
 # --- Endpoint: Upload files to a store ---
 @app.post("/stores/{store_name}/upload")
