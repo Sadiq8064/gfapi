@@ -1,515 +1,509 @@
+# gemini_file_search_api.py
+"""
+FastAPI backend for REAL Gemini File Search RAG (Option A: delete local temp file after indexing).
+- Keeps document_id logic (SDK + REST fallback).
+- Sanitizes filenames before uploading to avoid "Illegal header value" errors.
+- Deletes local temp file after successful (or attempted) indexing.
+"""
 
+import os
+import time
+import json
+import shutil
+import re
+import requests
+from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from pathlib import Path
+import aiofiles
 
-const GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta";
+# Try to import google genai SDK; endpoints will error clearly if it's missing.
+try:
+    from google import genai
+    from google.genai import types
+except Exception:
+    genai = None
+    types = None
 
-function json(body, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
+# ---------------- CONFIG ----------------
+DATA_FILE = "/data/gemini_stores.json"
+UPLOAD_ROOT = Path("/data/uploads")
+        # temporary local storage during upload
+MAX_FILE_BYTES = 50 * 1024 * 1024      # 50 MB default limit (can be skipped via form)
+POLL_INTERVAL = 2                       # seconds between polling long-running operations
+GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
+# ----------------------------------------
 
-function detectMimeType(filename, fallback = "application/octet-stream") {
-  if (!filename) return fallback;
-  const ext = filename.split(".").pop().toLowerCase();
-  const map = {
-    pdf: "application/pdf",
-    txt: "text/plain",
-    md: "text/markdown",
-    json: "application/json",
-    csv: "text/csv",
-    tsv: "text/tab-separated-values",
-    xml: "application/xml",
-    yaml: "text/yaml",
-    yml: "text/yaml",
-    doc: "application/msword",
-    docx:
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    xls: "application/vnd.ms-excel",
-    xlsx:
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ppt: "application/vnd.ms-powerpoint",
-    pptx:
-      "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    png: "image/png",
-    gif: "image/gif",
-    webp: "image/webp",
-    svg: "image/svg+xml",
-    js: "text/javascript",
-    ts: "application/typescript",
-    html: "text/html",
-    css: "text/css",
-    zip: "application/zip",
-  };
-  return map[ext] || fallback;
-}
+app = FastAPI(title="Gemini File Search RAG API (Option A)")
 
-function cleanFilename(name) {
-  if (!name) return "file";
-  let n = String(name).trim();
-  n = n.replace(/\s+/g, "_");
-  n = n.replace(/^\.+/, "");
-  n = n.replace(/[^A-Za-z0-9_\-\.]/g, "_");
-  n = n.replace(/__+/g, "_");
-  n = n.replace(/\.\.+/g, ".");
-  if (n.length > 180) n = n.slice(0, 180);
-  if (!n) return "file";
-  return n;
-}
+# ---------------- Helpers: persistence ----------------
 
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
-    const method = request.method.toUpperCase();
+def ensure_dirs():
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
-    // KV helpers
-    async function load() {
-      const raw = await env.RAG.get("stores");
-      return raw ? JSON.parse(raw) : { file_stores: {}, current_store_name: null };
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {"file_stores": {}, "current_store_name": None}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+ensure_dirs()
+if not os.path.exists(DATA_FILE):
+    save_data({"file_stores": {}, "current_store_name": None})
+
+# ---------------- Request models ----------------
+
+class CreateStoreRequest(BaseModel):
+    api_key: str
+    store_name: str
+
+class AskRequest(BaseModel):
+    api_key: str
+    stores: List[str]
+    question: str
+    system_prompt: Optional[str] = None
+
+# ---------------- Gemini client helper ----------------
+
+def init_gemini_client(api_key: str):
+    """Initialize google genai client (per-request). Raises on missing SDK or invalid key."""
+    if genai is None:
+        raise RuntimeError("google-genai SDK is not installed on the server.")
+    try:
+        return genai.Client(api_key=api_key)
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize Gemini client: {e}")
+
+def wait_for_operation(client, operation):
+    """
+    Poll a long-running operation object until done.
+    Works with SDK operation objects that support `.done` and client.operations.get(op).
+    """
+    op = operation
+    while not getattr(op, "done", False):
+        time.sleep(POLL_INTERVAL)
+        try:
+            # refresh operation if possible
+            if hasattr(client, "operations") and hasattr(client.operations, "get"):
+                op = client.operations.get(op)
+        except Exception:
+            # ignore refresh errors and continue polling
+            pass
+
+    if getattr(op, "error", None):
+        raise RuntimeError(f"Operation failed: {op.error}")
+
+    return op
+
+# ---------------- REST helper to list documents for a store ----------------
+
+def rest_list_documents_for_store(file_search_store_name: str, api_key: str):
+    """
+    Call Gemini REST to list documents for a File Search store.
+    Returns list of dicts with at least 'name' and optionally 'displayName'.
+    Example response.documents[i].name -> "fileSearchStores/xxx/documents/abc123"
+    """
+    url = f"{GEMINI_REST_BASE}/{file_search_store_name}/documents"
+    params = {"key": api_key}
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("documents", [])
+    except Exception:
+        return []
+
+# ---------------- Filename sanitization ----------------
+
+def clean_filename(name: str, max_len: int = 180) -> str:
+    """
+    Sanitize filenames to avoid server/API header issues.
+    Rules applied:
+      - strip leading/trailing whitespace
+      - normalize internal whitespace -> single underscore
+      - replace disallowed characters with underscore
+      - collapse consecutive underscores
+      - truncate to max_len
+      - avoid empty result (fallback to 'file')
+    """
+    if not name:
+        return "file"
+
+    # Normalize unicode and strip
+    name = str(name).strip()
+
+    # Replace any whitespace sequence with single underscore
+    name = re.sub(r"\s+", "_", name)
+
+    # Remove leading dots (avoid hidden files like .env)
+    name = re.sub(r"^\.+", "", name)
+
+    # Keep only safe characters: letters, digits, underscores, hyphens, dots
+    name = re.sub(r"[^A-Za-z0-9_\-\.]", "_", name)
+
+    # Collapse multiple underscores or dots
+    name = re.sub(r"__+", "_", name)
+    name = re.sub(r"\.\.+", ".", name)
+
+    # Trim to max length
+    if len(name) > max_len:
+        name = name[:max_len]
+
+    # Final fallback
+    if not name:
+        return "file"
+    return name
+
+# ---------------- Utility: build delete instruction template (NOT returned on upload per your request) ----------------
+
+def _build_example_delete_url(store_name: str, document_id: Optional[str]):
+    return f"DELETE /stores/{store_name}/documents/{document_id}?api_key=YOUR_API_KEY"
+
+# =====================================================
+# CREATE STORE (creates a Gemini File Search store)
+# =====================================================
+@app.post("/stores/create")
+def create_store(payload: CreateStoreRequest):
+    """
+    Create file search store on Gemini. Caller must pass their Gemini API key.
+    Response contains:
+      - store_name: what you provided (local identifier)
+      - file_search_store_resource: the Gemini resource name (fileSearchStores/...)
+      - created_at, file_count
+    Note: no extra instructions are returned per request.
+    """
+    try:
+        client = init_gemini_client(payload.api_key)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    data = load_data()
+    if payload.store_name in data["file_stores"]:
+        return JSONResponse({"error": "A store with this name already exists."}, status_code=400)
+
+    try:
+        fs_store = client.file_search_stores.create(config={"display_name": payload.store_name})
+        fs_store_name = getattr(fs_store, "name", None) or fs_store
+    except Exception as e:
+        return JSONResponse({"error": f"Failed to create File Search store on Gemini: {e}"}, status_code=500)
+
+    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    data["file_stores"][payload.store_name] = {
+        "store_name": payload.store_name,
+        "file_search_store_name": fs_store_name,
+        "created_at": created_at,
+        "files": []
     }
-    async function save(data) {
-      await env.RAG.put("stores", JSON.stringify(data));
-    }
+    data["current_store_name"] = payload.store_name
+    save_data(data)
 
-    // Helper: list documents via REST
-    async function rest_list_documents_for_store(file_search_store_name, apiKey) {
-      const u = `${GEMINI_REST_BASE}/${file_search_store_name}/documents?key=${encodeURIComponent(
-        apiKey
-      )}`;
-      try {
-        const resp = await fetch(u, { method: "GET" });
-        if (!resp.ok) return [];
-        const j = await resp.json();
-        return j.documents || [];
-      } catch {
-        return [];
-      }
-    }
-
-    // Helper: poll operation until done or timeout (returns opJson or null)
-    async function pollOperationUntilDone(operationName, apiKey, timeoutMs = 25000, intervalMs = 2000) {
-      const start = Date.now();
-      while (Date.now() - start < timeoutMs) {
-        try {
-          const opUrl = `${GEMINI_REST_BASE}/${operationName}?key=${encodeURIComponent(apiKey)}`;
-          const opResp = await fetch(opUrl, { method: "GET" });
-          if (!opResp.ok) {
-            // if non-200, still retry until timeout
-            await new Promise((r) => setTimeout(r, intervalMs));
-            continue;
-          }
-          const opJson = await opResp.json();
-          if (opJson.done) return opJson;
-        } catch (e) {
-          // continue retrying
-        }
-        await new Promise((r) => setTimeout(r, intervalMs));
-      }
-      return null;
-    }
-
-    // ---------------- ROUTES ----------------
-
-    // CREATE STORE
-    if (pathname === "/stores/create" && method === "POST") {
-      try {
-        const body = await request.json();
-        const apiKey = body.api_key || env.GEMINI_API_KEY;
-        const storeName = body.store_name;
-        if (!apiKey || !storeName) return json({ error: "Missing api_key or store_name" }, 400);
-
-        // Call REST create store
-        const createUrl = `${GEMINI_REST_BASE}/fileSearchStores?key=${encodeURIComponent(apiKey)}`;
-        const resp = await fetch(createUrl, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ displayName: storeName }),
-        });
-        if (!resp.ok) {
-          const t = await resp.text();
-          return json({ error: `Failed to create store: ${t}` }, resp.status);
-        }
-        const j = await resp.json();
-        const fsStoreName = j.name || j; // e.g. fileSearchStores/xxx
-
-        const data = await load();
-        if (data.file_stores[storeName]) {
-          return json({ error: "Store already exists" }, 400);
-        }
-
-        data.file_stores[storeName] = {
-          store_name: storeName,
-          file_search_store_name: fsStoreName,
-          created_at: new Date().toISOString(),
-          files: [],
-        };
-        data.current_store_name = storeName;
-        await save(data);
-
-        return json({
-          success: true,
-          store_name: storeName,
-          file_search_store_resource: fsStoreName,
-          created_at: data.file_stores[storeName].created_at,
-          file_count: 0,
-        });
-      } catch (err) {
-        return json({ error: err.toString() }, 500);
-      }
-    }
-
-    // UPLOAD FILE(S)
-    if (pathname.startsWith("/stores/") && pathname.endsWith("/upload") && method === "POST") {
-      const segments = pathname.split("/");
-      const storeName = segments[2];
-      const data = await load();
-      const store = data.file_stores[storeName];
-      if (!store) return json({ error: "Store not found" }, 404);
-
-      // Accept api_key either in form or fallback to env
-      const form = await request.formData();
-      const apiKey = form.get("api_key") || env.GEMINI_API_KEY;
-      if (!apiKey) return json({ error: "Missing api_key" }, 400);
-
-      // Collect files - support both "files" key (multiple) and any file entries
-      const files = [];
-      // formData.getAll('files') may not work if the client names differently; iterate entries
-      for (const entry of form.entries()) {
-        const [k, v] = entry;
-        if (v instanceof File) {
-          files.push(v);
-        }
-      }
-      if (files.length === 0) {
-        return json({ error: "No files provided in the form-data (file fields required)" }, 400);
-      }
-
-      const fsStoreName = store.file_search_store_name;
-      const results = [];
-
-      for (const file of files) {
-        const origName = file.name || "file";
-        const cleanedName = cleanFilename(origName);
-        const mimeType = detectMimeType(cleanedName);
-        let arrayBuffer;
-        try {
-          arrayBuffer = await file.arrayBuffer();
-        } catch (e) {
-          results.push({
-            filename: cleanedName,
-            uploaded: false,
-            indexed: false,
-            gemini_error: "Failed to read file contents: " + e.toString(),
-          });
-          continue;
-        }
-
-        // Build multipart with required 'metadata' JSON part and 'file' part
-        const fd = new FormData();
-        // metadata part must be JSON with displayName and optionally mimeType
-        const metadata = { displayName: cleanedName, mimeType };
-        fd.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-        fd.append("file", new Blob([arrayBuffer], { type: mimeType }), cleanedName);
-
-        const uploadUrl = `${GEMINI_REST_BASE}/${fsStoreName}:uploadToFileSearchStore?key=${encodeURIComponent(apiKey)}`;
-
-        let opName = null;
-        try {
-          const uploadResp = await fetch(uploadUrl, {
-            method: "POST",
-            body: fd,
-          });
-
-          if (!uploadResp.ok) {
-            const t = await uploadResp.text();
-            results.push({
-              filename: cleanedName,
-              uploaded: false,
-              indexed: false,
-              gemini_error: t,
-            });
-            continue;
-          }
-
-          // This endpoint may return either an operation name or an immediate response
-          const uploadJson = await uploadResp.json().catch((e) => {
-            // JSON parse failed
-            return null;
-          });
-
-          if (!uploadJson) {
-            results.push({
-              filename: cleanedName,
-              uploaded: false,
-              indexed: false,
-              gemini_error: "Invalid JSON response from Gemini upload endpoint",
-            });
-            continue;
-          }
-
-          // If operation name present, we'll poll in background
-          opName = uploadJson.name || uploadJson.operation || null;
-
-          // Some endpoints could return the fileSearchDocument immediately (rare). If so, update now.
-          const directDocResource =
-            uploadJson?.response?.fileSearchDocument?.name ||
-            uploadJson?.fileSearchDocument?.name ||
-            null;
-
-          // Save initial metadata (indexed false by default)
-          const entry = {
-            display_name: cleanedName,
-            size_bytes: arrayBuffer.byteLength,
-            uploaded_at: new Date().toISOString(),
-            gemini_indexed: directDocResource ? true : false,
-            document_resource: directDocResource,
-            document_id: directDocResource ? directDocResource.split("/").pop() : null,
-            gemini_error: null,
-            operation_name: opName,
-          };
-
-          store.files.push(entry);
-          await save(data);
-
-          // If we have an operation, poll in background for up to 25s
-          if (opName) {
-            ctx.waitUntil((async () => {
-              try {
-                const opJson = await pollOperationUntilDone(opName, apiKey, 25000, 2000);
-                if (opJson && opJson.done) {
-                  const docRes =
-                    opJson?.response?.fileSearchDocument?.name ||
-                    opJson?.response?.file_search_document?.name ||
-                    null;
-                  const docId = docRes ? docRes.split("/").pop() : null;
-
-                  // Update KV entry: find by operation_name and display_name
-                  const refreshed = await load();
-                  const localFiles = refreshed.file_stores?.[storeName]?.files || [];
-                  for (let f of localFiles) {
-                    if (f.operation_name === opName && f.display_name === cleanedName) {
-                      f.gemini_indexed = !!docRes;
-                      f.document_resource = docRes;
-                      f.document_id = docId;
-                      delete f.operation_name;
-                      break;
-                    }
-                  }
-                  await save(refreshed);
-                } else {
-                  // timed out - leave operation_name so /sync can find it later
-                }
-              } catch (bgErr) {
-                // swallow background errors
-                console.error("Background poll error:", String(bgErr));
-              }
-            })());
-          }
-
-          results.push({
-            filename: cleanedName,
-            uploaded: true,
-            indexed: !!directDocResource,
-            document_resource: directDocResource,
-            document_id: directDocResource ? directDocResource.split("/").pop() : null,
-            gemini_error: null,
-            operation_name: opName,
-          });
-        } catch (e) {
-          results.push({
-            filename: cleanedName,
-            uploaded: false,
-            indexed: false,
-            gemini_error: e.toString(),
-          });
-          continue;
-        }
-      } // end for files
-
-      // Save final store state (some entries were added above)
-      await save(data);
-
-      // Immediate response — indexing may continue in background
-      return json({ success: true, results });
+    return {
+        "success": True,
+        "store_name": payload.store_name,
+        "file_search_store_resource": fs_store_name,
+        "created_at": created_at,
+        "file_count": 0
     }
 
-    // LIST STORES
-    if (pathname === "/stores" && method === "GET") {
-      try {
-        const apiKey = url.searchParams.get("api_key") || env.GEMINI_API_KEY;
-        if (!apiKey) return json({ error: "Missing api_key" }, 400);
-        // optional: verify key by fetching stores list (lightweight)
-        // skip explicit fetch to keep fast; user can detect auth errors on create/upload
-        const data = await load();
-        return json({ success: true, stores: Object.values(data.file_stores) });
-      } catch (e) {
-        return json({ error: e.toString() }, 500);
-      }
-    }
+# =====================================================
+# UPLOAD files (index into the File Search store)
+# =====================================================
+@app.post("/stores/{store_name}/upload")
+async def upload_files(
+    store_name: str,
+    api_key: str = Form(...),
+    limit: Optional[bool] = Form(True),
+    files: List[UploadFile] = File(...)
+):
+    """
+    Upload and index files to the given store. Returns:
+      - filename, uploaded, indexed (bool), document_resource, document_id, gemini_error
+    (No deletion instructions returned in response per your request.)
+    """
+    data = load_data()
+    if store_name not in data["file_stores"]:
+        raise HTTPException(status_code=404, detail="Store not found")
 
-    // SYNC endpoint (populate missing document_ids by listing remote docs)
-    if (pathname.startsWith("/stores/") && pathname.endsWith("/sync") && method === "POST") {
-      const segments = pathname.split("/");
-      const storeName = segments[2];
-      const body = await request.json().catch(() => ({}));
-      const apiKey = body?.api_key || env.GEMINI_API_KEY;
-      if (!apiKey) return json({ error: "Missing api_key" }, 400);
+    try:
+        client = init_gemini_client(api_key)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-      const data = await load();
-      const store = data.file_stores[storeName];
-      if (!store) return json({ error: "Store not found" }, 404);
+    store_meta = data["file_stores"][store_name]
+    fs_store_name = store_meta.get("file_search_store_name")
+    if not fs_store_name:
+        raise HTTPException(status_code=500, detail="File Search store mapping missing")
 
-      const fsStore = store.file_search_store_name;
-      const docs = await rest_list_documents_for_store(fsStore, apiKey);
+    # temp folder for this upload - cleaned after indexing
+    temp_folder = UPLOAD_ROOT / store_name
+    temp_folder.mkdir(parents=True, exist_ok=True)
 
-      let updated = 0;
-      for (const d of docs) {
-        const display = d.displayName || d.display_name || "";
-        const name = d.name || "";
-        if (!display || !name) continue;
+    results = []
 
-        // find matching local entry
-        const local = store.files.find(
-          (f) =>
-            f.display_name === display ||
-            (f.display_name && name.includes(f.display_name))
-        );
-        if (local && !local.document_id) {
-          local.document_resource = name;
-          local.document_id = name.split("/").pop();
-          local.gemini_indexed = true;
-          if (local.operation_name) delete local.operation_name;
-          updated++;
+    for upload in files:
+        original_filename = upload.filename or "file"
+        filename = clean_filename(original_filename)
+
+        temp_path = temp_folder / filename
+
+        # ---- write the file locally in streaming chunks (required by SDK) ----
+        size = 0
+        try:
+            async with aiofiles.open(temp_path, "wb") as out_f:
+                while True:
+                    chunk = await upload.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if limit and size > MAX_FILE_BYTES:
+                        # abort write and report
+                        await out_f.close()
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+                        results.append({
+                            "filename": filename,
+                            "uploaded": False,
+                            "indexed": False,
+                            "reason": f"File exceeds limit of {MAX_FILE_BYTES} bytes (50MB)."
+                        })
+                        break
+                    await out_f.write(chunk)
+            # if file exceeded limit we continued above; skip to next file
+            if results and results[-1].get("filename") == filename and results[-1].get("uploaded") is False:
+                continue
+        except Exception as e:
+            results.append({
+                "filename": filename,
+                "uploaded": False,
+                "indexed": False,
+                "reason": f"Failed to save local file: {e}"
+            })
+            continue
+
+        # ---- upload & index directly into Gemini File Search (this chunks + embeds + indexes) ----
+        document_resource = None
+        document_id = None
+        indexed_ok = False
+        gemini_error = None
+
+        try:
+            # Use the sanitized filename in the display_name sent to Gemini
+            op = client.file_search_stores.upload_to_file_search_store(
+                file=str(temp_path),
+                file_search_store_name=fs_store_name,
+                config={"display_name": filename}
+            )
+            # Wait for indexing to complete
+            op = wait_for_operation(client, op)
+
+            # Many SDK versions return the newly created document inside operation response.
+            try:
+                document_resource = op.response.file_search_document.name
+            except Exception:
+                document_resource = None
+
+            # If SDK did not provide document resource, call REST to list documents and match by displayName
+            if not document_resource:
+                docs = rest_list_documents_for_store(fs_store_name, api_key)
+                # look for document whose displayName matches sanitized filename (best-effort)
+                for d in docs:
+                    display = d.get("displayName") or d.get("display_name") or ""
+                    name = d.get("name") or ""
+                    if display and display == filename:
+                        document_resource = name
+                        break
+                # fallback: match partial token
+                if not document_resource:
+                    for d in docs:
+                        name = d.get("name") or ""
+                        if filename in name:
+                            document_resource = name
+                            break
+
+            if document_resource:
+                document_id = document_resource.split("/")[-1]
+                indexed_ok = True
+            else:
+                # If no resource returned but SDK operation finished without raising,
+                # indexing most likely occurred — still mark indexed_ok True but doc id unknown.
+                indexed_ok = True
+
+        except Exception as e:
+            gemini_error = str(e)
+            indexed_ok = False
+
+        # OPTION A: delete local temp file immediately to avoid disk usage
+        try:
+            if temp_path.exists():
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+        # Record metadata locally (we keep metadata even if doc_id is missing)
+        entry = {
+            "display_name": filename,
+            "size_bytes": size,
+            "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "gemini_indexed": indexed_ok,
+            "document_resource": document_resource,
+            "document_id": document_id,
+            "gemini_error": gemini_error
         }
-      }
+        store_meta.setdefault("files", []).append(entry)
+        save_data(data)
 
-      await save(data);
-      return json({ success: true, updated_count: updated, total_remote_documents: docs.length });
-    }
+        results.append({
+            "filename": filename,
+            "uploaded": True,
+            "indexed": indexed_ok,
+            "document_resource": document_resource,
+            "document_id": document_id,
+            "gemini_error": gemini_error
+        })
 
-    // DELETE DOCUMENT
-    if (pathname.startsWith("/stores/") && pathname.includes("/documents/") && method === "DELETE") {
-      const segments = pathname.split("/");
-      const storeName = segments[2];
-      const documentId = segments[4];
-      const apiKey = url.searchParams.get("api_key") || env.GEMINI_API_KEY;
-      if (!apiKey) return json({ error: "Missing api_key" }, 400);
+    # return consolidated result
+    return {"success": True, "results": results}
 
-      const data = await load();
-      const store = data.file_stores[storeName];
-      if (!store) return json({ error: "Store not found" }, 404);
+# =====================================================
+# LIST STORES (with files metadata)
+# =====================================================
+@app.get("/stores")
+def list_stores(api_key: str):
+    """List local stores and files. Validates the provided Gemini API key by trying to init the client."""
+    try:
+        init_gemini_client(api_key)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
-      const fsStore = store.file_search_store_name;
-      const deleteURL = `${GEMINI_REST_BASE}/${fsStore}/documents/${documentId}?force=true&key=${encodeURIComponent(apiKey)}`;
+    data = load_data()
+    # return stores as list for readability
+    return {"success": True, "stores": list(data["file_stores"].values())}
 
-      try {
-        const resp = await fetch(deleteURL, { method: "DELETE" });
-        if (![200, 204].includes(resp.status)) {
-          const t = await resp.text();
-          return json({ success: false, error: t }, resp.status);
-        }
-      } catch (e) {
-        return json({ success: false, error: e.toString() }, 500);
-      }
+# =====================================================
+# DELETE DOCUMENT (calls Gemini REST to remove doc from File Search store)
+# =====================================================
+@app.delete("/stores/{store_name}/documents/{document_id}")
+def delete_document(store_name: str, document_id: str, api_key: str):
+    """
+    Delete a single document from the File Search store using REST:
+      DELETE https://generativelanguage.googleapis.com/v1beta/{fileSearchStore}/documents/{document_id}?force=true&key={api_key}
+    Also removes this document entry from local metadata.
+    """
+    data = load_data()
+    if store_name not in data["file_stores"]:
+        raise HTTPException(status_code=404, detail="Store not found")
 
-      // remove locally
-      store.files = store.files.filter((f) => f.document_id !== documentId);
-      await save(data);
-      return json({ success: true, deleted_document_id: documentId });
-    }
+    meta = data["file_stores"][store_name]
+    fs_store = meta.get("file_search_store_name")
+    if not fs_store:
+        raise HTTPException(status_code=500, detail="File search store mapping missing")
 
-    // DELETE STORE
-    if (pathname.startsWith("/stores/") && method === "DELETE") {
-      const segments = pathname.split("/");
-      const storeName = segments[2];
-      const apiKey = url.searchParams.get("api_key") || env.GEMINI_API_KEY;
-      if (!apiKey) return json({ error: "Missing api_key" }, 400);
+    doc_resource = f"{fs_store}/documents/{document_id}"
+    url = f"{GEMINI_REST_BASE}/{doc_resource}"
+    params = {"force": "true", "key": api_key}
 
-      const data = await load();
-      const store = data.file_stores[storeName];
-      if (!store) return json({ error: "Store not found" }, 404);
+    try:
+        resp = requests.delete(url, params=params, timeout=15)
+    except Exception as e:
+        return JSONResponse({"success": False, "error": f"REST request failed: {e}"}, status_code=500)
 
-      // attempt remote delete
-      try {
-        const delUrl = `${GEMINI_REST_BASE}/${store.file_search_store_name}?key=${encodeURIComponent(apiKey)}`;
-        await fetch(delUrl, { method: "DELETE" });
-      } catch (e) {
-        // swallow
-      }
+    if resp.status_code not in (200, 204):
+        return JSONResponse({"success": False, "error": f"Gemini REST DELETE failed: {resp.text}"}, status_code=resp.status_code)
 
-      delete data.file_stores[storeName];
-      if (data.current_store_name === storeName) data.current_store_name = null;
-      await save(data);
-      return json({ success: true, deleted_store: storeName });
-    }
+    # remove local metadata entry if present
+    meta["files"] = [f for f in meta.get("files", []) if f.get("document_id") != document_id]
+    data["file_stores"][store_name] = meta
+    save_data(data)
 
-    // ASK (RAG) via models.generateContent endpoint (REST)
-    if (pathname === "/ask" && method === "POST") {
-      try {
-        const body = await request.json();
-        const apiKey = body.api_key || env.GEMINI_API_KEY;
-        const stores = body.stores || [];
-        const question = body.question;
-        const system_prompt = body.system_prompt;
+    return {"success": True, "deleted_document_id": document_id}
 
-        if (!apiKey) return json({ error: "Missing api_key" }, 400);
-        if (!question) return json({ error: "Missing question" }, 400);
+# =====================================================
+# DELETE ENTIRE STORE (remote + local)
+# =====================================================
+@app.delete("/stores/{store_name}")
+def delete_store(store_name: str, api_key: str):
+    data = load_data()
+    if store_name not in data["file_stores"]:
+        raise HTTPException(status_code=404, detail="Store not found")
 
-        const data = await load();
-        const fsStoreNames = [];
-        for (const s of stores) {
-          if (data.file_stores?.[s]?.file_search_store_name) {
-            fsStoreNames.push(data.file_stores[s].file_search_store_name);
-          }
-        }
-        if (fsStoreNames.length === 0) {
-          return json({ error: "No valid File Search stores found for provided store names." }, 400);
-        }
+    meta = data["file_stores"][store_name]
+    fs_store = meta.get("file_search_store_name")
 
-        const genUrl = `${GEMINI_REST_BASE}/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
-        const payload = {
-          contents: [{ parts: [{ text: question }] }],
-          tools: [
-            {
-              file_search: {
-                file_search_store_names: fsStoreNames,
-              },
-            },
-          ],
-        };
-        // include system instruction if provided
-        if (system_prompt) {
-          payload["config"] = { systemInstruction: system_prompt };
-        }
+    # Attempt delete on Gemini (best-effort)
+    try:
+        client = init_gemini_client(api_key)
+        client.file_search_stores.delete(name=fs_store, config={"force": True})
+    except Exception:
+        # swallow exceptions - we still remove local metadata
+        pass
 
-        const resp = await fetch(genUrl, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(payload),
-        });
+    # Delete local temp folder
+    folder = UPLOAD_ROOT / store_name
+    if folder.exists():
+        try:
+            shutil.rmtree(folder)
+        except Exception:
+            pass
 
-        if (!resp.ok) {
-          const t = await resp.text();
-          return json({ error: `generateContent failed: ${t}` }, resp.status);
-        }
-        const j = await resp.json();
+    del data["file_stores"][store_name]
+    if data.get("current_store_name") == store_name:
+        data["current_store_name"] = None
+    save_data(data)
 
-        // Extract text and grounding metadata if present
-        // generateContent responses vary; try to read likely fields
-        const text = j?.candidates?.[0]?.output?.[0]?.content || j?.output?.[0]?.content || j?.text || "";
-        const grounding =
-          j?.candidates?.[0]?.grounding_metadata || j?.candidates?.[0]?.groundingMetadata || null;
+    return {"success": True, "deleted_store": store_name}
 
-        return json({ success: true, response_text: text, grounding_metadata: grounding });
-      } catch (e) {
-        return json({ error: e.toString() }, 500);
-      }
-    }
+# =====================================================
+# ASK QUESTION (RAG) - uses Gemini File Search tool
+# =====================================================
+@app.post("/ask")
+def ask_question(payload: AskRequest):
+    try:
+        client = init_gemini_client(payload.api_key)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
-    // Default: not found
-    return json({ error: "Route not found" }, 404);
-  },
-};
+    data = load_data()
+    fs_store_names = []
+    for s in payload.stores:
+        if s in data["file_stores"]:
+            v = data["file_stores"][s].get("file_search_store_name")
+            if v:
+                fs_store_names.append(v)
+
+    if not fs_store_names:
+        return JSONResponse({"error": "No valid File Search stores found for provided store names."}, status_code=400)
+
+    try:
+        # Build File Search tool
+        file_search_tool = types.Tool(file_search=types.FileSearch(file_search_store_names=fs_store_names))
+        system_instruction = payload.system_prompt or (
+            "You are a document summarization assistant. ONLY summarize information directly found in provided File Search stores."
+        )
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=payload.question,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=[file_search_tool],
+                temperature=0.2
+            )
+        )
+
+        # extract grounding metadata if present
+        grounding = None
+        if hasattr(response, "candidates") and len(response.candidates) > 0:
+            grounding = getattr(response.candidates[0], "grounding_metadata", None)
+
+        return {"success": True, "response_text": getattr(response, "text", ""), "grounding_metadata": grounding}
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
