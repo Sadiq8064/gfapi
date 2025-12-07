@@ -425,6 +425,70 @@ def delete_document(store_name: str, document_id: str, api_key: str):
 
     return {"success": True, "deleted_document_id": document_id}
 
+
+
+@app.get("/users/{user_id}/usage")
+def get_usage(user_id: str):
+    """
+    Returns usage summary for the user:
+      - API key usage (bytes used + remaining)
+      - Store usage per store
+      - File list with sizes
+    """
+    data = load_data()
+
+    # Get user data
+    user_doc = db.collection("users").document(user_id).get()
+    if not user_doc.exists:
+        raise HTTPException(404, "User not found")
+
+    user = user_doc.to_dict()
+    api_keys = user.get("apiKeys", [])
+
+    # ---------- BUILD API KEY USAGE ----------
+    key_usage = []
+    for entry in api_keys:
+        key = entry.get("key")
+        used = compute_api_key_usage_bytes(user_id, key)
+        remaining = MAX_TOTAL_BYTES_PER_API_KEY - used
+
+        key_usage.append({
+            "api_key": key,
+            "used_bytes": used,
+            "remaining_bytes": remaining
+        })
+
+    # ---------- BUILD STORE USAGE ----------
+    store_usage = []
+    for store_name, meta in data["file_stores"].items():
+        if meta.get("user_id") != user_id:
+            continue
+
+        total_size = sum([f.get("size_bytes", 0) for f in meta.get("files", [])])
+
+        store_usage.append({
+            "store_name": store_name,
+            "display_name": meta.get("display_name"),
+            "api_key_used": meta.get("api_key"),
+            "total_store_bytes": total_size,
+            "document_count": len(meta.get("files", [])),
+            "files": [
+                {
+                    "document_id": f.get("document_id"),
+                    "display_name": f.get("display_name"),
+                    "size_bytes": f.get("size_bytes"),
+                    "uploaded_at": f.get("uploaded_at")
+                }
+                for f in meta.get("files", [])
+            ]
+        })
+
+    return {
+        "success": True,
+        "user_id": user_id,
+        "api_key_usage": key_usage,
+        "stores": store_usage
+    }
 # =====================================================
 # DELETE ENTIRE STORE (remote + local)
 # =====================================================
@@ -459,7 +523,7 @@ def delete_store(store_name: str, api_key: str):
     save_data(data)
 
     return {"success": True, "deleted_store": store_name}
-
+ 
 # =====================================================
 # ASK QUESTION (RAG) - uses Gemini File Search tool
 # =====================================================
