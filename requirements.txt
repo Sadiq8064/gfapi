@@ -1,7 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 aiofiles
 google-genai
 requests
 pydantic
 python-multipart
+pymongo
