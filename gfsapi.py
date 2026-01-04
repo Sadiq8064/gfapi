@@ -1,9 +1,9 @@
 # gemini_file_search_api.py
 """
 FastAPI backend for REAL Gemini File Search RAG (Option A: delete local temp file after indexing).
-- Keeps document_id logic (SDK + REST fallback).
-- Sanitizes filenames before uploading to avoid "Illegal header value" errors.
-- Deletes local temp file after successful (or attempted) indexing.
+- Uses MongoDB for persistent storage with API key as primary identifier
+- Each API key has its own isolated stores
+- All external API interfaces remain exactly the same
 """
 
 import os
@@ -18,6 +18,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 import aiofiles
+from datetime import datetime
+from bson import ObjectId
+import pymongo
+from pymongo import MongoClient
 
 # Try to import google genai SDK; endpoints will error clearly if it's missing.
 try:
@@ -28,34 +32,159 @@ except Exception:
     types = None
 
 # ---------------- CONFIG ----------------
-DATA_FILE = "/data/gemini_stores.json"
 UPLOAD_ROOT = Path("/data/uploads")
-        # temporary local storage during upload
 MAX_FILE_BYTES = 50 * 1024 * 1024      # 50 MB default limit (can be skipped via form)
 POLL_INTERVAL = 2                       # seconds between polling long-running operations
 GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+# MongoDB configuration
+MONGODB_URI = "mongodb+srv://wisdomkagyan_db_user:gqbCoXr99sKOcXEw@cluster0.itxqujm.mongodb.net/?appName=Cluster0"
+DATABASE_NAME = "gemini_file_search"
+COLLECTION_NAME = "user_stores"
 # ----------------------------------------
 
 app = FastAPI(title="Gemini File Search RAG API (Option A)")
 
-# ---------------- Helpers: persistence ----------------
+# ---------------- MongoDB Setup ----------------
 
+def get_mongo_client():
+    """Get MongoDB client connection"""
+    try:
+        client = MongoClient(MONGODB_URI)
+        # Test the connection
+        client.admin.command('ping')
+        return client
+    except Exception as e:
+        raise RuntimeError(f"Failed to connect to MongoDB: {e}")
+
+def get_database():
+    """Get database instance"""
+    client = get_mongo_client()
+    return client[DATABASE_NAME]
+
+def get_collection():
+    """Get the stores collection"""
+    db = get_database()
+    return db[COLLECTION_NAME]
+
+# Initialize collection with proper indexes
+def init_mongodb():
+    """Initialize MongoDB with proper indexes"""
+    try:
+        collection = get_collection()
+        # Create compound index on api_key and store_name for fast lookups
+        collection.create_index([("api_key", pymongo.ASCENDING), ("store_name", pymongo.ASCENDING)], unique=True)
+        # Create index on api_key alone for querying all stores by API key
+        collection.create_index([("api_key", pymongo.ASCENDING)])
+        print("MongoDB initialized successfully")
+    except Exception as e:
+        print(f"MongoDB initialization warning: {e}")
+
+# Run initialization on startup
+init_mongodb()
+
+# ---------------- Helpers: MongoDB persistence ----------------
+
+def load_user_data(api_key: str):
+    """Load all stores for a given API key"""
+    collection = get_collection()
+    stores = list(collection.find({"api_key": api_key}, {"_id": 0}))
+    
+    # Convert to the old format for compatibility
+    file_stores = {}
+    for store in stores:
+        store_name = store["store_name"]
+        file_stores[store_name] = {
+            "store_name": store_name,
+            "file_search_store_name": store["file_search_store_name"],
+            "created_at": store["created_at"],
+            "files": store.get("files", [])
+        }
+    
+    # Determine current store (last created)
+    current_store_name = None
+    if stores:
+        # Sort by created_at to get most recent
+        sorted_stores = sorted(stores, key=lambda x: x["created_at"], reverse=True)
+        current_store_name = sorted_stores[0]["store_name"]
+    
+    return {
+        "file_stores": file_stores,
+        "current_store_name": current_store_name
+    }
+
+def save_store(api_key: str, store_name: str, file_search_store_name: str, files=None):
+    """Save or update a store for a specific API key"""
+    if files is None:
+        files = []
+    
+    collection = get_collection()
+    store_data = {
+        "api_key": api_key,
+        "store_name": store_name,
+        "file_search_store_name": file_search_store_name,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "files": files
+    }
+    
+    # Upsert the store
+    collection.update_one(
+        {"api_key": api_key, "store_name": store_name},
+        {"$set": store_data},
+        upsert=True
+    )
+
+def delete_store_from_db(api_key: str, store_name: str):
+    """Delete a store from MongoDB"""
+    collection = get_collection()
+    result = collection.delete_one({"api_key": api_key, "store_name": store_name})
+    return result.deleted_count > 0
+
+def delete_document_from_store(api_key: str, store_name: str, document_id: str):
+    """Remove a document from a store's files list"""
+    collection = get_collection()
+    result = collection.update_one(
+        {"api_key": api_key, "store_name": store_name},
+        {"$pull": {"files": {"document_id": document_id}}}
+    )
+    return result.modified_count > 0
+
+def add_file_to_store(api_key: str, store_name: str, file_entry: dict):
+    """Add a file entry to a store"""
+    collection = get_collection()
+    result = collection.update_one(
+        {"api_key": api_key, "store_name": store_name},
+        {"$push": {"files": file_entry}}
+    )
+    return result.modified_count > 0
+
+def get_store(api_key: str, store_name: str):
+    """Get a specific store by API key and store name"""
+    collection = get_collection()
+    return collection.find_one({"api_key": api_key, "store_name": store_name}, {"_id": 0})
+
+def get_all_stores_for_api_key(api_key: str):
+    """Get all stores for a specific API key"""
+    collection = get_collection()
+    stores = list(collection.find({"api_key": api_key}, {"_id": 0}))
+    
+    # Format for response
+    formatted_stores = []
+    for store in stores:
+        formatted_stores.append({
+            "store_name": store["store_name"],
+            "file_search_store_name": store["file_search_store_name"],
+            "created_at": store["created_at"],
+            "files": store.get("files", [])
+        })
+    
+    return formatted_stores
+
+# Ensure upload directory exists
 def ensure_dirs():
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {"file_stores": {}, "current_store_name": None}
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
-
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
 ensure_dirs()
-if not os.path.exists(DATA_FILE):
-    save_data({"file_stores": {}, "current_store_name": None})
 
 # ---------------- Request models ----------------
 
@@ -65,7 +194,7 @@ class CreateStoreRequest(BaseModel):
 
 class AskRequest(BaseModel):
     api_key: str
-    stores: List[str]
+    stores: List[str] = []  # Made optional with default empty list
     question: str
     system_prompt: Optional[str] = None
 
@@ -160,11 +289,6 @@ def clean_filename(name: str, max_len: int = 180) -> str:
         return "file"
     return name
 
-# ---------------- Utility: build delete instruction template (NOT returned on upload per your request) ----------------
-
-def _build_example_delete_url(store_name: str, document_id: Optional[str]):
-    return f"DELETE /stores/{store_name}/documents/{document_id}?api_key=YOUR_API_KEY"
-
 # =====================================================
 # CREATE STORE (creates a Gemini File Search store)
 # =====================================================
@@ -183,9 +307,10 @@ def create_store(payload: CreateStoreRequest):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    data = load_data()
-    if payload.store_name in data["file_stores"]:
-        return JSONResponse({"error": "A store with this name already exists."}, status_code=400)
+    # Check if store already exists for this API key
+    existing_store = get_store(payload.api_key, payload.store_name)
+    if existing_store:
+        return JSONResponse({"error": "A store with this name already exists for your API key."}, status_code=400)
 
     try:
         fs_store = client.file_search_stores.create(config={"display_name": payload.store_name})
@@ -193,15 +318,15 @@ def create_store(payload: CreateStoreRequest):
     except Exception as e:
         return JSONResponse({"error": f"Failed to create File Search store on Gemini: {e}"}, status_code=500)
 
-    created_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    data["file_stores"][payload.store_name] = {
-        "store_name": payload.store_name,
-        "file_search_store_name": fs_store_name,
-        "created_at": created_at,
-        "files": []
-    }
-    data["current_store_name"] = payload.store_name
-    save_data(data)
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Save to MongoDB
+    save_store(
+        api_key=payload.api_key,
+        store_name=payload.store_name,
+        file_search_store_name=fs_store_name,
+        files=[]
+    )
 
     return {
         "success": True,
@@ -226,22 +351,22 @@ async def upload_files(
       - filename, uploaded, indexed (bool), document_resource, document_id, gemini_error
     (No deletion instructions returned in response per your request.)
     """
-    data = load_data()
-    if store_name not in data["file_stores"]:
-        raise HTTPException(status_code=404, detail="Store not found")
+    # Check if store exists for this API key
+    store_meta = get_store(api_key, store_name)
+    if not store_meta:
+        raise HTTPException(status_code=404, detail="Store not found for your API key")
 
     try:
         client = init_gemini_client(api_key)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    store_meta = data["file_stores"][store_name]
     fs_store_name = store_meta.get("file_search_store_name")
     if not fs_store_name:
         raise HTTPException(status_code=500, detail="File Search store mapping missing")
 
     # temp folder for this upload - cleaned after indexing
-    temp_folder = UPLOAD_ROOT / store_name
+    temp_folder = UPLOAD_ROOT / api_key / store_name
     temp_folder.mkdir(parents=True, exist_ok=True)
 
     results = []
@@ -347,18 +472,17 @@ async def upload_files(
         except Exception:
             pass
 
-        # Record metadata locally (we keep metadata even if doc_id is missing)
+        # Record metadata in MongoDB
         entry = {
             "display_name": filename,
             "size_bytes": size,
-            "uploaded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "uploaded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "gemini_indexed": indexed_ok,
             "document_resource": document_resource,
             "document_id": document_id,
             "gemini_error": gemini_error
         }
-        store_meta.setdefault("files", []).append(entry)
-        save_data(data)
+        add_file_to_store(api_key, store_name, entry)
 
         results.append({
             "filename": filename,
@@ -368,6 +492,13 @@ async def upload_files(
             "document_id": document_id,
             "gemini_error": gemini_error
         })
+
+    # Clean up temp folder if empty
+    try:
+        if temp_folder.exists() and not any(temp_folder.iterdir()):
+            shutil.rmtree(temp_folder)
+    except Exception:
+        pass
 
     # return consolidated result
     return {"success": True, "results": results}
@@ -383,9 +514,10 @@ def list_stores(api_key: str):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    data = load_data()
-    # return stores as list for readability
-    return {"success": True, "stores": list(data["file_stores"].values())}
+    # Get all stores for this API key
+    stores = get_all_stores_for_api_key(api_key)
+    
+    return {"success": True, "stores": stores}
 
 # =====================================================
 # DELETE DOCUMENT (calls Gemini REST to remove doc from File Search store)
@@ -397,11 +529,11 @@ def delete_document(store_name: str, document_id: str, api_key: str):
       DELETE https://generativelanguage.googleapis.com/v1beta/{fileSearchStore}/documents/{document_id}?force=true&key={api_key}
     Also removes this document entry from local metadata.
     """
-    data = load_data()
-    if store_name not in data["file_stores"]:
-        raise HTTPException(status_code=404, detail="Store not found")
+    # Check if store exists for this API key
+    meta = get_store(api_key, store_name)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Store not found for your API key")
 
-    meta = data["file_stores"][store_name]
     fs_store = meta.get("file_search_store_name")
     if not fs_store:
         raise HTTPException(status_code=500, detail="File search store mapping missing")
@@ -418,10 +550,8 @@ def delete_document(store_name: str, document_id: str, api_key: str):
     if resp.status_code not in (200, 204):
         return JSONResponse({"success": False, "error": f"Gemini REST DELETE failed: {resp.text}"}, status_code=resp.status_code)
 
-    # remove local metadata entry if present
-    meta["files"] = [f for f in meta.get("files", []) if f.get("document_id") != document_id]
-    data["file_stores"][store_name] = meta
-    save_data(data)
+    # Remove from MongoDB
+    delete_document_from_store(api_key, store_name, document_id)
 
     return {"success": True, "deleted_document_id": document_id}
 
@@ -430,11 +560,11 @@ def delete_document(store_name: str, document_id: str, api_key: str):
 # =====================================================
 @app.delete("/stores/{store_name}")
 def delete_store(store_name: str, api_key: str):
-    data = load_data()
-    if store_name not in data["file_stores"]:
-        raise HTTPException(status_code=404, detail="Store not found")
+    # Check if store exists for this API key
+    meta = get_store(api_key, store_name)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Store not found for your API key")
 
-    meta = data["file_stores"][store_name]
     fs_store = meta.get("file_search_store_name")
 
     # Attempt delete on Gemini (best-effort)
@@ -446,17 +576,15 @@ def delete_store(store_name: str, api_key: str):
         pass
 
     # Delete local temp folder
-    folder = UPLOAD_ROOT / store_name
+    folder = UPLOAD_ROOT / api_key / store_name
     if folder.exists():
         try:
             shutil.rmtree(folder)
         except Exception:
             pass
 
-    del data["file_stores"][store_name]
-    if data.get("current_store_name") == store_name:
-        data["current_store_name"] = None
-    save_data(data)
+    # Delete from MongoDB
+    delete_store_from_db(api_key, store_name)
 
     return {"success": True, "deleted_store": store_name}
 
@@ -470,16 +598,26 @@ def ask_question(payload: AskRequest):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    data = load_data()
     fs_store_names = []
-    for s in payload.stores:
-        if s in data["file_stores"]:
-            v = data["file_stores"][s].get("file_search_store_name")
-            if v:
-                fs_store_names.append(v)
+    
+    # If stores list is empty, get ALL stores for this API key
+    if not payload.stores:
+        all_stores = get_all_stores_for_api_key(payload.api_key)
+        for store in all_stores:
+            fs_name = store.get("file_search_store_name")
+            if fs_name:
+                fs_store_names.append(fs_name)
+    else:
+        # Use only the specified stores
+        for store_name in payload.stores:
+            store = get_store(payload.api_key, store_name)
+            if store:
+                fs_name = store.get("file_search_store_name")
+                if fs_name:
+                    fs_store_names.append(fs_name)
 
     if not fs_store_names:
-        return JSONResponse({"error": "No valid File Search stores found for provided store names."}, status_code=400)
+        return JSONResponse({"error": "No valid File Search stores found for your API key."}, status_code=400)
 
     try:
         # Build File Search tool
@@ -507,3 +645,14 @@ def ask_question(payload: AskRequest):
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+# Health check endpoint
+@app.get("/health")
+def health_check():
+    """Health check endpoint to verify MongoDB connection"""
+    try:
+        client = get_mongo_client()
+        client.admin.command('ping')
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return JSONResponse({"status": "unhealthy", "error": str(e)}, status_code=500)
